@@ -5,7 +5,9 @@ use neptune::{Arity, Strength};
 use ff::{PrimeField, PrimeFieldBits};
 
 use std::cmp::PartialOrd;
+use std::ops::Bound::{Excluded, Unbounded};
 use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
 use crate::hash::vanilla::hash;
@@ -51,12 +53,28 @@ where
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, PartialOrd)]
+pub struct LeafValue<F: PrimeField + PrimeFieldBits>(F);
+
+impl<F: PrimeField + PrimeFieldBits + PartialOrd> Ord for LeafValue<F> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        if self.0 < other.0 {
+            std::cmp::Ordering::Less
+        } else if self.0 > other.0 {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
-pub struct IndexTree<F: PrimeField + PrimeFieldBits, const N: usize, AL: Arity<F>, AN: Arity<F>> {
+pub struct IndexTree<F: PrimeField + PrimeFieldBits + PartialOrd, const N: usize, AL: Arity<F>, AN: Arity<F>> {
     pub root: F,
     pub hash_db: HashMap<String, (F, F)>,
     pub inserted_leaves: Vec<Leaf<F, AL>>,
     pub next_insertion_idx: F,
+    pub leaves_btree: BTreeMap<LeafValue<F>, usize>,
     pub leaf_hash_params: PoseidonConstants<F, AL>,
     pub node_hash_params: PoseidonConstants<F, AN>,
 }
@@ -76,16 +94,19 @@ impl<F: PrimeField + PrimeFieldBits + PartialOrd, const N: usize, AL: Arity<F>, 
             cur_hash = hash(vec![cur_hash.clone(), cur_hash.clone()], &node_hash_params);
             hash_db.insert(format!("{:?}", cur_hash.clone()), val);
         }
-        let inserted_leaves: Vec<Leaf<F, AL>> = vec![empty_leaf_val];
-        let next_insertion_index = F::ONE;
+        let inserted_leaves: Vec<Leaf<F, AL>> = vec![empty_leaf_val.clone()];
+        let next_insertion_idx = F::ONE;
+        let mut leaves_btree  = BTreeMap::new();
+        leaves_btree.insert(LeafValue(empty_leaf_val.value.unwrap()), 0usize);
 
         Self {
             root: cur_hash,
-            hash_db: hash_db,
-            inserted_leaves: inserted_leaves,
-            next_insertion_idx: next_insertion_index,
-            leaf_hash_params: leaf_hash_params,
-            node_hash_params: node_hash_params,
+            hash_db,
+            inserted_leaves,
+            next_insertion_idx,
+            leaves_btree,
+            leaf_hash_params,
+            node_hash_params,
         }
     }
 
@@ -160,6 +181,8 @@ impl<F: PrimeField + PrimeFieldBits + PartialOrd, const N: usize, AL: Arity<F>, 
             self.hash_db
                 .insert(format!("{:?}", cur_new_leaf_hash.clone()), val);
         }
+
+        self.leaves_btree.insert(LeafValue(new_val), scalar_to_index(N, self.next_insertion_idx));
         self.next_insertion_idx += F::ONE;
         self.root = cur_new_leaf_hash;
         self.inserted_leaves.push(new_leaf); // Push the new lead to inserted leaf
@@ -216,19 +239,9 @@ impl<F: PrimeField + PrimeFieldBits + PartialOrd, const N: usize, AL: Arity<F>, 
     pub fn get_low_leaf(&self, new_value: Option<F>) -> (Leaf<F, AL>, u64) {
         match new_value {
             Some(new_value) => {
-                let mut low_leaf = Leaf::default();
-                let mut low_index = 0;
-                for (i, leaf) in self.inserted_leaves.iter().enumerate() {
-                    if leaf.value.unwrap() < new_value
-                        && (leaf.next_value.unwrap() >= new_value
-                            || leaf.next_value.unwrap() == F::ZERO)
-                    {
-                        low_leaf = leaf.clone();
-                        low_index = i as u64;
-                        break;
-                    }
-                }
-                (low_leaf, low_index)
+                let low_index = self.get_low_leaf_index(new_value);
+                let low_leaf = self.inserted_leaves[low_index].clone();
+                (low_leaf, low_index as u64)
             }
             None => {
                 let low_leaf = Leaf {
@@ -242,32 +255,31 @@ impl<F: PrimeField + PrimeFieldBits + PartialOrd, const N: usize, AL: Arity<F>, 
         }
     }
 
-    // Get Leaf with containing value
+    pub fn get_low_leaf_index(&self, new_value: F) -> usize {
+        let res = self.leaves_btree.range((Unbounded, Excluded(&LeafValue(new_value)))).next_back();
+        let low_leaf_index = match res {
+            Some((_leaf_value, index)) => {
+                *index
+            },
+            None => 0usize,
+        };
+
+        low_leaf_index
+    }
+
+    // Get Leaf with containing value using BTreeMap
     pub fn get_leaf(&self, value: Option<F>) -> (Leaf<F, AL>, u64) {
-        match value {
-            Some(value) => {
-                let mut out_leaf = Leaf::default();
-                let mut out_index = 0;
-                for (i,leaf) in self.inserted_leaves.iter().enumerate() {
-                    if leaf.value.unwrap() == value
-                    {
-                        out_leaf = leaf.clone();
-                        out_index = i as u64;
-                        break;
-                    }
-                }
-                (out_leaf, out_index)
-            }
-            None => {
-                let out_leaf = Leaf {
-                    value: None,
-                    next_index: None,
-                    next_value: None,
-                    _arity: PhantomData,
-                };
-                (out_leaf, 0)
+        let mut out_leaf = Leaf::default();
+        let mut out_index = 0;
+
+        if let Some(v) = value {
+            if let Some(index) = self.leaves_btree.get(&LeafValue(v)) {
+                out_leaf = self.inserted_leaves[*index].clone();
+                out_index = *index as u64;
+                
             }
         }
+        (out_leaf, out_index)
     }
 }
 
@@ -291,6 +303,21 @@ pub fn idx_to_bits<F: PrimeField + PrimeFieldBits>(depth: usize, idx: F) -> Vec<
 
     path.reverse();
     path // path is from root to leaf
+}
+
+fn scalar_to_index<F: PrimeField + PrimeFieldBits>(depth: usize, scalar: F) -> usize {
+    let mut index = 0usize;
+    let mut i = 0usize;
+    for b in scalar.to_le_bits() {
+        if i >= depth {
+            break;
+        }
+        if b {
+            index += 1 << i;
+        }
+        i += 1;
+    }
+    index
 }
 
 #[derive(Clone)]
